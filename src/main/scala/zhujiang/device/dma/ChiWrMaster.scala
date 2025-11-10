@@ -1,0 +1,226 @@
+package zhujiang.device.dma
+
+import chisel3._
+import chisel3.util._
+import org.chipsalliance.cde.config._
+import org.chipsalliance.cde.config.Parameters
+import chisel3.experimental.BundleLiterals._
+import zhujiang._
+import zhujiang.chi._
+import zhujiang.axi._
+import xs.utils.sram._
+import xijiang._
+import xs.utils.{CircularQueuePtr, HasCircularQueuePtrHelper, UIntToMask}
+import dongjiang.utils.VipEncoder
+import freechips.rocketchip.diplomacy.BufferParams.pipe
+import dongjiang.bundle.Chi
+
+class ChiWrMaster(node: Node)(implicit p: Parameters) extends ZJModule with HasCircularQueuePtrHelper {
+    private val rni            = DmaParams(node = node)
+    private val axiParams      = node.axiDevParams.get.extPortParams.getOrElse(AxiParams())
+    private val axiParamsUser  = axiParams.copy(idBits = log2Ceil(node.outstanding), userBits = axiParams.idBits + log2Ceil(node.outstanding))
+    private val axiWParamsUser = axiParams.copy(userBits = log2Ceil(node.outstanding))
+
+    val io = IO(new Bundle {
+        val reqDB    = Decoupled(Bool())
+        val respDB   = Input(Valid(new DataBufferAlloc(rni.bufferSize)))
+        val axiAw    = Flipped(Decoupled(new AWFlit(axiParamsUser)))
+        val axiW     = Flipped(Decoupled(new WFlit(axiWParamsUser)))
+        val axiB     = Decoupled(new BFlit(axiParams))
+        val chiReq   = Decoupled(new ReqFlit)
+        val chiRxRsp = Flipped(Decoupled(new RespFlit))
+        val chiTxRsp = Decoupled(new RespFlit)
+        val rdDB     = Decoupled(new readWrDataBuffer(rni.bufferSize))
+        val wrDB     = Decoupled(new writeWrDataBuffer(rni.bufferSize))
+        val finish   = Valid(new Finish(node))
+    })
+
+    private val chiEntries     = RegInit(VecInit(Seq.fill(node.outstanding)((new CHIWEntry(node)).Lit(_.valid -> false.B))))
+    private val chiEntriesNext = WireInit(chiEntries)
+    private val rdDBQueue      = Module(new Queue(gen = new RdDBWrEntry(node), entries = 2, flow = false, pipe = false))
+    private val rdDBSitePtr    = RegInit(0.U(1.W))
+
+    private val txReqBdl = WireInit(0.U.asTypeOf(new DmaReqFlit))
+    private val axiBBdl  = WireInit(0.U.asTypeOf(io.axiB.bits))
+    private val toDBQBdl = WireInit(0.U.asTypeOf(new RdDBWrEntry(node)))
+    private val rdDBBdl  = WireInit(0.U.asTypeOf(io.rdDB.bits))
+    private val txAckBdl = WireInit(0.U.asTypeOf(io.chiTxRsp.bits))
+
+    private val rcvResp    = io.chiRxRsp.fire & io.chiRxRsp.bits.TxnID(io.chiRxRsp.bits.TxnID.getWidth - 1)
+    private val rcvIsDBID  = io.chiRxRsp.fire & (io.chiRxRsp.bits.Opcode === RspOpcode.DBIDResp | io.chiRxRsp.bits.Opcode === RspOpcode.CompDBIDResp) & io.chiRxRsp.bits.TxnID(io.chiRxRsp.bits.TxnID.getWidth - 1)
+    private val rcvIsComp  = io.chiRxRsp.fire & (io.chiRxRsp.bits.Opcode === RspOpcode.Comp | io.chiRxRsp.bits.Opcode === RspOpcode.CompDBIDResp) & io.chiRxRsp.bits.TxnID(io.chiRxRsp.bits.TxnID.getWidth - 1)
+    private val rspTxnid   = io.chiRxRsp.bits.TxnID(log2Ceil(node.outstanding) - 1, 0)
+    private val bTransid   = io.axiB.bits.id(log2Ceil(node.outstanding) - 1, 0)
+    private val txIsAck    = io.chiTxRsp.fire
+    private val addrInTag  = io.axiAw.bits.addr(rni.matchSet - 1, rni.offset)
+    private val rdDBPtrMod = io.rdDB.fire && ((rdDBQueue.io.deq.bits.fullSize && rdDBSitePtr === 0.U) || (rdDBSitePtr === 1.U))
+    private val finishBdl  = WireInit(0.U.asTypeOf(new Finish(node)))
+
+    private val userArid_hi = io.axiAw.bits.user.getWidth - 1
+    private val userArid_lo = log2Ceil(node.outstanding)
+    private val userEid_hi  = log2Ceil(node.outstanding) - 1
+
+    private val axiAWID = io.axiAw.bits.user(userArid_hi, userArid_lo)
+    private val axiEid  = io.axiAw.bits.user(userEid_hi, 0)
+    private val maxNid  = Fill(log2Ceil(node.outstanding), true.B)
+
+    private val validVec   = chiEntries.map(c => c.valid)
+    private val sendReqVec = chiEntries.map(c => !c.state.sendReq && c.reqNid === 0.U && c.valid)
+
+    private val waitDataVec = chiEntries.map(c => c.valid && !c.state.rcvDataCmp)
+    private val sendAckVec  = chiEntries.map(c => (c.isSendAck) && c.ackNid === 0.U)
+    private val sendDataVec = chiEntries.map(c => c.isSendData)
+    private val finishVec   = chiEntries.map(c => c.complete && c.valid && (c.finishNid === 0.U))
+    private val sendBVec    = chiEntries.map(c => c.isSendBResp && (c.bNid === 0.U))
+    private val sameAWIdVec = chiEntries.map(c => !c.state.sendBResp && (c.awId === io.axiAw.bits.user(userArid_hi, userArid_lo) && c.valid))
+
+    private val sendReqValid  = sendReqVec.reduce(_ | _)
+    private val sendAckValid  = sendAckVec.reduce(_ | _)
+    private val finishValid   = finishVec.reduce(_ | _)
+    private val sendDataValid = sendDataVec.reduce(_ | _)
+    private val sendBValid    = sendBVec.reduce(_ | _)
+
+    private val selSendReq  = VipEncoder(sendReqVec, sendReqValid)
+    private val selSendAck  = VipEncoder(sendAckVec, sendAckValid)
+    private val selFinish   = VipEncoder(finishVec, finishValid)
+    private val selSendData = VipEncoder(sendDataVec, sendDataValid)
+    private val selSendB    = VipEncoder(sendBVec, sendBValid)
+
+    private val blockReqVec   = VecInit(chiEntries.zipWithIndex.map { case (c, i) => c.shodBlockReq(axiAWID, axiEid) && !(rcvIsDBID && (rspTxnid === i.U)) })
+    private val blockAckVec   = VecInit(chiEntries.zipWithIndex.map { case (c, i) => c.shodBlockAck(axiAWID, axiEid) && !(rcvIsComp && (rspTxnid === i.U)) })
+    private val blockBRespVec = VecInit(chiEntries.zipWithIndex.map { case (c, i) => c.shodBlockBResp(axiAWID) && !(io.axiB.fire && (selSendB === i.U)) })
+    private val blockFshVec   = VecInit(chiEntries.zipWithIndex.map { case (c, i) => c.shodBlockFinish(axiEid) && !((selFinish === i.U) && finishValid) })
+
+    private val blockReqVecReg = RegEnable(blockReqVec, io.axiAw.fire)
+    private val blockAckVecReg = RegEnable(blockAckVec, io.axiAw.fire)
+    private val blockBVecReg   = RegEnable(blockBRespVec, io.axiAw.fire)
+    private val blockFshVecReg = RegEnable(blockFshVec, io.axiAw.fire)
+
+    finishBdl.idx      := selFinish
+    finishBdl.streamID := chiEntries(selFinish).eId
+
+    private val dbidTxnidPipe = Pipe(rcvIsDBID, rspTxnid)
+    private val compTxnidPipe = Pipe(rcvIsComp, rspTxnid)
+    private val finishPipe    = Pipe(finishValid, finishBdl)
+    private val bidPipe       = Pipe(io.axiB.fire, selSendB)
+
+    private val waitNidSetEn = RegNext(io.axiAw.fire)
+    private val selIdNextReg = RegNext(io.axiAw.bits.id, 0.U)
+
+    for (i <- chiEntriesNext.indices) {
+        when(io.axiAw.fire & (io.axiAw.bits.id === i.U)) {
+            assert(!chiEntries(i).valid)
+            assert(io.reqDB.ready === true.B)
+            chiEntries(i).awMesInit(io.axiAw.bits, maxNid, maxNid, maxNid, maxNid, io.respDB.bits)
+        }.elsewhen(validVec(i)) {
+            chiEntries(i) := chiEntriesNext(i)
+        }
+    }
+
+    for (((en, e), i) <- chiEntriesNext.zip(chiEntries).zipWithIndex) {
+        when(rcvResp & rspTxnid === i.U) {
+            assert((!e.state.rcvComp) || (!e.state.rcvDBID))
+            en.dbid          := io.chiRxRsp.bits.DBID
+            en.tgtid         := io.chiRxRsp.bits.SrcID
+            en.state.rcvComp := Mux(rcvIsComp, true.B, e.state.rcvComp)
+            en.state.rcvDBID := Mux(rcvIsDBID, true.B, e.state.rcvDBID)
+        }
+        when(dbidTxnidPipe.valid && (chiEntries(dbidTxnidPipe.bits).awId === e.awId) && (chiEntries(dbidTxnidPipe.bits).eId =/= e.eId) && (e.reqNid =/= 0.U)) {
+            en.reqNid := e.reqNid - 1.U
+        }
+        when(compTxnidPipe.valid && (chiEntries(compTxnidPipe.bits).awId === e.awId) && (chiEntries(compTxnidPipe.bits).eId =/= e.eId) && (e.ackNid =/= 0.U)) {
+            en.ackNid := e.ackNid - 1.U
+        }
+        when((selSendAck === i.U) && io.chiTxRsp.fire) {
+            assert(!e.state.sendAck)
+            en.state.sendAck := true.B
+        }
+        when(io.axiW.fire && io.axiW.bits._last && (io.axiW.bits.user === i.U)) {
+            assert(!e.state.rcvDataCmp)
+            en.state.rcvDataCmp := true.B
+        }
+        when(io.chiReq.fire && (selSendReq === i.U)) {
+            assert(!e.state.sendReq)
+            en.state.sendReq := true.B
+        }
+        when((selFinish === i.U) && finishValid) {
+            assert(e.complete)
+            en.valid := false.B
+        }
+        when(finishPipe.valid && (finishPipe.bits.streamID === e.eId) && (e.finishNid =/= 0.U)) {
+            en.finishNid := e.finishNid - 1.U
+        }
+        when(io.axiB.fire && selSendB === i.U) {
+            assert(!e.state.sendBResp)
+            en.state.sendBResp := true.B
+        }
+        when(bidPipe.valid && (chiEntries(bidPipe.bits).awId === e.awId) && (e.bNid =/= 0.U)) {
+            en.bNid := e.bNid - 1.U
+        }
+        when((selSendData === i.U) && rdDBQueue.io.enq.fire) {
+            assert(!e.state.sendData)
+            en.state.sendData := true.B
+        }
+        when(e.allTaskComp) {
+            en.complete := true.B
+        }
+        when(waitNidSetEn && (selIdNextReg === i.U)) {
+            en.reqNid    := PopCount(blockReqVecReg)
+            en.ackNid    := PopCount(blockAckVecReg)
+            en.bNid      := PopCount(blockBVecReg)
+            en.finishNid := PopCount(blockFshVecReg)
+        }
+    }
+
+    rdDBSitePtr := Mux(rdDBPtrMod, rdDBSitePtr + 1.U, rdDBSitePtr)
+
+    txReqBdl.wReqInit(chiEntries(selSendReq), selSendReq, node)
+    toDBQBdl.rdWrDBInit(chiEntries(selSendData))
+    rdDBBdl.dataID  := Mux((rdDBSitePtr === 0.U) && (rdDBQueue.io.deq.bits.shift === 0.U), 0.U, 2.U)
+    rdDBBdl.set     := Mux(rdDBSitePtr === 0.U, rdDBQueue.io.deq.bits.dbSite1, rdDBQueue.io.deq.bits.dbSite2)
+    rdDBBdl.tgtId   := rdDBQueue.io.deq.bits.tgtId
+    rdDBBdl.txnID   := rdDBQueue.io.deq.bits.txnID
+    axiBBdl         := 0.U.asTypeOf(axiBBdl)
+    axiBBdl.id      := selSendB
+    txAckBdl        := 0.U.asTypeOf(txAckBdl)
+    txAckBdl.SrcID  := rni.rniID.U
+    txAckBdl.TxnID  := chiEntries(selSendAck).dbid
+    txAckBdl.TgtID  := chiEntries(selSendAck).tgtid
+    txAckBdl.Opcode := RspOpcode.CompAck
+
+    io.reqDB.bits     := io.axiAw.bits.len(0)
+    io.reqDB.valid    := io.axiAw.fire
+    io.wrDB.bits.data := io.axiW.bits.data
+    io.wrDB.bits.mask := io.axiW.bits.strb
+    io.wrDB.bits.set  := Mux(io.axiW.bits._last && chiEntries(io.axiW.bits.user).fullSize, chiEntries(io.axiW.bits.user).dbSite2, chiEntries(io.axiW.bits.user).dbSite1)
+    io.wrDB.valid     := io.axiW.valid
+    io.axiAw.ready    := io.reqDB.ready
+    io.axiW.ready     := waitDataVec.reduce(_ | _) && io.wrDB.ready
+    io.chiReq.valid   := sendReqValid
+    io.chiReq.bits    := txReqBdl
+    io.finish.valid   := finishPipe.valid
+    io.finish.bits    := finishPipe.bits
+    io.chiRxRsp.ready := true.B
+    io.axiB.valid     := sendBValid
+    io.axiB.bits      := axiBBdl
+    io.rdDB.bits      := rdDBBdl
+    io.rdDB.valid     := rdDBQueue.io.deq.valid
+    io.chiTxRsp.bits  := txAckBdl
+    io.chiTxRsp.valid := sendAckValid
+
+    rdDBQueue.io.enq.bits  := toDBQBdl
+    rdDBQueue.io.enq.valid := sendDataValid
+    rdDBQueue.io.deq.ready := io.rdDB.ready && (rdDBQueue.io.deq.bits.fullSize && (rdDBSitePtr === 1.U) || (!rdDBQueue.io.deq.bits.fullSize))
+
+    when(rdDBQueue.io.deq.valid && !rdDBQueue.io.deq.bits.fullSize) {
+        assert(rdDBSitePtr === 0.U)
+    }
+
+    when(io.axiW.fire && !io.axiW.bits.last.asBool) {
+        assert(chiEntries(io.axiW.bits.user).fullSize)
+    }
+    when(io.axiB.fire) {
+        assert(chiEntries(bTransid).bNid === 0.U)
+    }
+
+}

@@ -1,0 +1,8 @@
+.idea
+out
+.vscode
+build
+.metal
+*.icl
+*.pdl
+*.gz
