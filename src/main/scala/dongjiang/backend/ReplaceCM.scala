@@ -172,12 +172,12 @@ class ReplaceEntry(implicit p: Parameters) extends DJModule {
     HAssert.withEn(io.writeDir.bits.llc.bits.meta.isValid, io.writeDir.valid & io.writeDir.bits.llc.valid & !io.writeDir.bits.llc.bits.hit)
     HAssert.withEn(io.writeDir.bits.sf.bits.metaIsVal, io.writeDir.valid & io.writeDir.bits.sf.valid & !io.writeDir.bits.sf.bits.hit)
 
-    val sfRespHit   = reg.isWaitDir & io.respDir.sf.valid & io.respDir.sf.bits.hnTxnID === reg.hnTxnID
-    val llcRespHit  = reg.isWaitDir & io.respDir.llc.valid & io.respDir.llc.bits.hnTxnID === reg.hnTxnID
-    val dirRespHit  = sfRespHit | llcRespHit
-    val needReplSF  = io.respDir.sf.valid & io.respDir.sf.bits.metaVec.map(_.isValid).reduce(_ | _)
-    val needReplLLC = io.respDir.llc.valid & io.respDir.llc.bits.metaVec.head.isValid
-    val respAddr    = Mux(io.respDir.sf.valid, io.respDir.sf.bits.addr, io.respDir.llc.bits.addr)
+    val sfRespHit     = reg.isWaitDir & io.respDir.sf.valid & io.respDir.sf.bits.hnTxnID === reg.hnTxnID
+    val llcRespHit    = reg.isWaitDir & io.respDir.llc.valid & io.respDir.llc.bits.hnTxnID === reg.hnTxnID
+    val dirRespHit    = sfRespHit | llcRespHit
+    val needReplSF    = io.respDir.sf.valid & io.respDir.sf.bits.metaVec.map(_.isValid).reduce(_ | _)
+    val needWriteBack = io.respDir.llc.valid & io.respDir.llc.bits.meta.isDirty
+    val respAddr      = Mux(io.respDir.sf.valid, io.respDir.sf.bits.addr, io.respDir.llc.bits.addr)
     HAssert(!(io.respDir.sf.valid & io.respDir.llc.valid))
     HAssert.withEn(reg.isReplSF, sfRespHit)
     HAssert.withEn(reg.isReplLLC, llcRespHit)
@@ -218,7 +218,7 @@ class ReplaceEntry(implicit p: Parameters) extends DJModule {
     io.cmTaskVec(CMID.WRI).bits                       := DontCare
     io.cmTaskVec(CMID.WRI).bits.chi.nodeId            := DontCare
     io.cmTaskVec(CMID.WRI).bits.chi.channel           := ChiChannel.REQ
-    io.cmTaskVec(CMID.WRI).bits.chi.opcode            := Mux(reg.repl.toLan, WriteNoSnpFull, Mux(reg.dir.llc.meta.isDirty, WriteBackFull, WriteEvictOrEvict))
+    io.cmTaskVec(CMID.WRI).bits.chi.opcode            := Mux(reg.repl.toLan, WriteNoSnpFull, WriteBackFull)
     io.cmTaskVec(CMID.WRI).bits.chi.dataVec           := Seq(true.B, true.B)
     io.cmTaskVec(CMID.WRI).bits.chi.memAttr.allocate  := false.B
     io.cmTaskVec(CMID.WRI).bits.chi.memAttr.device    := false.B
@@ -229,7 +229,7 @@ class ReplaceEntry(implicit p: Parameters) extends DJModule {
     io.cmTaskVec(CMID.WRI).bits.hnTxnID               := reg.repl.hnTxnID
     io.cmTaskVec(CMID.WRI).bits.fromRepl              := true.B
     io.cmTaskVec(CMID.WRI).bits.ds                    := reg.ds
-    io.cmTaskVec(CMID.WRI).bits.cbResp                := Mux(reg.repl.toLan, ChiResp.I, reg.dir.llc.meta.cbResp)
+    io.cmTaskVec(CMID.WRI).bits.cbResp                := Mux(reg.repl.toLan, ChiResp.I, ChiResp.UD_PD)
     io.cmTaskVec(CMID.WRI).bits.dataOp.repl           := true.B
 
     io.cmTaskVec.foreach(_.bits.qos := reg.qos)
@@ -281,7 +281,7 @@ class ReplaceEntry(implicit p: Parameters) extends DJModule {
         }
 
         is(WAITDIR) {
-            when(dirRespHit) { next.state := Mux(sfRespHit, RESPCMT, Mux(needReplLLC, UPDATEID, SAVEDATA)) }
+            when(dirRespHit) { next.state := Mux(sfRespHit, RESPCMT, Mux(needWriteBack, UPDATEID, SAVEDATA)) }
         }
 
         is(UPDATEID) {
