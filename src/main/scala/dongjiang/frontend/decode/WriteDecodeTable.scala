@@ -39,7 +39,21 @@ object Write_LAN {
         )
     )
 
-    def writeNoSnpPtlTable: Seq[DecodeType] = Seq(writeNoSnpPtl_noEWA_EO, writeNoSnpPtl_noEWA_OWO, writeNoSnpPtl_ewa_OWO)
+    def writeNoSnpPtl_noEWA_RO: DecodeType = (
+        fromLAN | toLAN | reqIs(WriteNoSnpPtl) | isRO,
+        Seq(
+            (sfMiss | llcIs(I)) -> (returnDBID, Seq(NCBWrData -> second(tdop("send") | write(WriteNoSnpPtl), waitSecDone | cmtRsp(Comp))))
+        )
+    )
+
+    def writeNoSnpPtl_ewa_RO: DecodeType = (
+        fromLAN | toLAN | reqIs(WriteNoSnpPtl) | ewa | isRO,
+        Seq(
+            (sfMiss | llcIs(I)) -> (returnDBID, Seq(NCBWrData -> second(tdop("send") | write(WriteNoSnpPtl), cmtRsp(Comp))))
+        )
+    )
+
+    def writeNoSnpPtlTable: Seq[DecodeType] = Seq(writeNoSnpPtl_noEWA_EO, writeNoSnpPtl_noEWA_OWO, writeNoSnpPtl_ewa_OWO, writeNoSnpPtl_noEWA_RO, writeNoSnpPtl_ewa_RO)
 
     def writeUniquePtl_noEWA: DecodeType = (
         fromLAN | toLAN | reqIs(WriteUniquePtl) | isOWO,
